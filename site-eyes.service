@@ -11,6 +11,8 @@ Environment=PATH=/mnt/shared/runtime/node/bin:/usr/local/sbin:/usr/local/bin:/us
 Environment=PLAYWRIGHT_BROWSERS_PATH=/mnt/shared/app/.pw-browsers
 Environment=SITE_EYES_PORT=8080
 Environment=SITE_EYES_WORKERS=3
+# Optional .env overrides the Environment= lines above (values win when set)
+EnvironmentFile=-/mnt/shared/app/.env
 ExecStart=/mnt/shared/runtime/node/bin/node /mnt/shared/app/server.js
 Restart=on-failure
 RestartSec=3
