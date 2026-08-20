@@ -1,0 +1,6 @@
+.token
+node_modules/
+.pw-browsers/
+jobs/
+*.log
+*.bak*
