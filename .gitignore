@@ -1,4 +1,5 @@
 .token
+.env
 node_modules/
 .pw-browsers/
 jobs/

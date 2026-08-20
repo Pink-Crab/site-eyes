@@ -5,10 +5,10 @@
   "type": "module",
   "description": "Synchronous browser-check REST API backed by a Playwright worker pool.",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.9"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node --env-file-if-exists=.env server.js"
   },
   "dependencies": {
     "@axe-core/playwright": "^4.12.1",

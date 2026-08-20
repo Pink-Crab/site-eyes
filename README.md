@@ -53,25 +53,33 @@ re-read forever via `GET /jobs/:jobId` without re-running it.
 
 ## Install
 
-Requirements: Node ≥ 22 (see `engines` in `package.json`).
+Requirements: Node ≥ 22.9 (see `engines` in `package.json`).
 
 ```bash
 npm install
-npx playwright install chromium   # or set PLAYWRIGHT_BROWSERS_PATH first
+npx playwright install --with-deps chromium
+cp .env.example .env                                      # then edit as needed
 head -c 32 /dev/urandom | xxd -p -c 64 > .token && chmod 600 .token
 npm start
 ```
 
-Configuration is environment variables only:
+## Configuration
 
-| Variable | Default | Meaning |
+Environment variables only, all optional. Copy `.env.example` to `.env` and
+adjust — `npm start` loads it via Node's `--env-file-if-exists`, and the
+systemd unit loads the same file via `EnvironmentFile=`.
+
+| Variable | Code default | Meaning |
 |---|---|---|
 | `SITE_EYES_PORT` | `8080` | listen port (binds `0.0.0.0`) |
 | `SITE_EYES_WORKERS` | `3` | bounded worker pool — parallel captures |
 | `SITE_EYES_JOB_TIMEOUT_MS` | `90000` | hard cap per job; the job's browser context is closed |
-| `SITE_EYES_JOBS` | `/mnt/shared/jobs` | where job artifact directories are written |
-| `SITE_EYES_TOKEN_FILE` | `/mnt/shared/app/.token` | file holding the bearer token |
-| `PLAYWRIGHT_BROWSERS_PATH` | Playwright default | where Chromium lives |
+| `SITE_EYES_JOBS` | `/mnt/shared/jobs` | where job artifact directories are written (created on demand) |
+| `SITE_EYES_TOKEN_FILE` | `/mnt/shared/app/.token` | file holding the bearer token — the server refuses to start without it |
+| `PLAYWRIGHT_BROWSERS_PATH` | Playwright default | where Chromium lives (read by Playwright itself) |
+
+The two path defaults suit the original deployment; on a fresh clone set them
+in `.env` (`.env.example` ships `./jobs` and `./.token`).
 
 `site-eyes.service` is a reference systemd unit — adjust its paths to your
 install and enable it for restart-on-failure supervision.
