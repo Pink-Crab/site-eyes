@@ -7,6 +7,7 @@ Every shape below is either taken from a real capture or from `collect.js`.
 
 ```
 POST <host>:<port>/check            Authorization: Bearer <token>
+POST <host>:<port>/check?cache=<s>  Bearer — reuse an identical request under <s> seconds old
 GET  <host>:<port>/health           no auth
 GET  <host>:<port>/jobs/<jobId>     Bearer — past job, artifacts inlined
 GET  <host>:<port>/jobs/<jobId>/<file>   Bearer — one raw artifact
@@ -20,6 +21,11 @@ Calls are **synchronous** — `/check` blocks until the capture finishes. Use a
 client timeout of at least 120s. `SITE_EYES_WORKERS` (default 3) captures run
 in parallel; extra callers queue. If you disconnect while queued or mid-job,
 the job is killed.
+
+`?cache=<seconds>` answers from the last identical request (same `url`,
+`commands`, `returns`, `cookies`, `viewport`, `timeout`) if it is younger than
+that, without opening a browser. The response then has `cached: true`,
+`ageSeconds`, and the original `jobId`. Fresh runs carry `cached: false`.
 
 ## Pre-flight
 

@@ -3,5 +3,6 @@
 node_modules/
 .pw-browsers/
 jobs/
+cache/
 *.log
 *.bak*

@@ -51,6 +51,24 @@ Every requested return is also written to the job directory as `<key>.json`
 (plus `content.html` for `html`, and any screenshots/PDFs), so a capture can be
 re-read forever via `GET /jobs/:jobId` without re-running it.
 
+### Caching: `POST /check?cache=<seconds>`
+
+Add `?cache=<seconds>` and an identical request answered within that many
+seconds comes back from the earlier job instead of opening a browser. The
+response gains `cached: true` and `ageSeconds`, and carries the original
+`jobId`, `results` and `returns`. Without the parameter every call runs fresh
+(`cached: false`).
+
+"Identical" means the same `url`, `commands`, `returns`, `cookies`, `viewport`
+and `timeout`, compared with keys sorted. Every successful `/check` writes a
+small index file to `SITE_EYES_CACHE`, `<sha256>.json`, naming the job and
+when it ran; the data itself is read back from that job's folder, so nothing
+is stored twice. If any of the job's files are gone, the call runs fresh.
+
+```bash
+curl -s -X POST "http://localhost:8080/check?cache=1500" ...   # reuse anything under 25 minutes old
+```
+
 ## Install
 
 Requirements: Node ≥ 22.9 (see `engines` in `package.json`).
@@ -75,6 +93,7 @@ systemd unit loads the same file via `EnvironmentFile=`.
 | `SITE_EYES_WORKERS` | `3` | bounded worker pool — parallel captures |
 | `SITE_EYES_JOB_TIMEOUT_MS` | `90000` | hard cap per job; the job's browser context is closed |
 | `SITE_EYES_JOBS` | `/mnt/shared/jobs` | where job artifact directories are written (created on demand) |
+| `SITE_EYES_CACHE` | `cache/` beside `SITE_EYES_JOBS` | where `/check?cache=` keeps its per-request index files |
 | `SITE_EYES_TOKEN_FILE` | `/mnt/shared/app/.token` | file holding the bearer token — the server refuses to start without it |
 | `PLAYWRIGHT_BROWSERS_PATH` | Playwright default | where Chromium lives (read by Playwright itself) |
 
