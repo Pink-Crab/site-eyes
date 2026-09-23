@@ -51,9 +51,28 @@ Every requested return is also written to the job directory as `<key>.json`
 (plus `content.html` for `html`, and any screenshots/PDFs), so a capture can be
 re-read forever via `GET /jobs/:jobId` without re-running it.
 
+### Memoise: `POST /check?memoise=1`
+
+Opt in. With `?memoise=1`, if an identical request has succeeded before, its
+stored result comes back instead of opening a browser, with `memoised: true`
+added. If there is none, the call runs as normal. Without the parameter
+nothing changes.
+
+"Identical" means the same `url`, `commands`, `returns`, `cookies`, `viewport`
+and `timeout`, compared with keys sorted. Every successful `/check` is indexed
+in a SQLite table at `SITE_EYES_MEMOISE_DB` (one row per distinct request,
+naming its latest job); the data itself is read back from that job's folder,
+so nothing is stored twice. If any of the job's files are gone, the call runs
+fresh. Keep the database on a local disk: SQLite locking is unreliable on
+network filesystems.
+
+```bash
+curl -s -X POST "http://localhost:8080/check?memoise=1" ...
+```
+
 ## Install
 
-Requirements: Node ≥ 22.9 (see `engines` in `package.json`).
+Requirements: Node ≥ 22.13, for the built-in `node:sqlite` (see `engines` in `package.json`).
 
 ```bash
 npm install
@@ -75,6 +94,7 @@ systemd unit loads the same file via `EnvironmentFile=`.
 | `SITE_EYES_WORKERS` | `3` | bounded worker pool — parallel captures |
 | `SITE_EYES_JOB_TIMEOUT_MS` | `90000` | hard cap per job; the job's browser context is closed |
 | `SITE_EYES_JOBS` | `/mnt/shared/jobs` | where job artifact directories are written (created on demand) |
+| `SITE_EYES_MEMOISE_DB` | `/var/lib/site-eyes/memoise.db` | SQLite index behind `/check?memoise=1`; local disk only |
 | `SITE_EYES_TOKEN_FILE` | `/mnt/shared/app/.token` | file holding the bearer token — the server refuses to start without it |
 | `PLAYWRIGHT_BROWSERS_PATH` | Playwright default | where Chromium lives (read by Playwright itself) |
 

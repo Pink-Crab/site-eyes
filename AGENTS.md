@@ -7,6 +7,7 @@ Every shape below is either taken from a real capture or from `collect.js`.
 
 ```
 POST <host>:<port>/check            Authorization: Bearer <token>
+POST <host>:<port>/check?memoise=1  Bearer — return an identical earlier request's result if one exists
 GET  <host>:<port>/health           no auth
 GET  <host>:<port>/jobs/<jobId>     Bearer — past job, artifacts inlined
 GET  <host>:<port>/jobs/<jobId>/<file>   Bearer — one raw artifact
@@ -20,6 +21,11 @@ Calls are **synchronous** — `/check` blocks until the capture finishes. Use a
 client timeout of at least 120s. `SITE_EYES_WORKERS` (default 3) captures run
 in parallel; extra callers queue. If you disconnect while queued or mid-job,
 the job is killed.
+
+`?memoise=1` (opt in) answers from the last identical successful request (same
+`url`, `commands`, `returns`, `cookies`, `viewport`, `timeout`) without opening
+a browser. That response has `memoised: true` and the original `jobId`. With no
+earlier match, or without the parameter, the call runs as normal.
 
 ## Pre-flight
 

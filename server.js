@@ -5,6 +5,7 @@ import { chromium } from 'playwright';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { runCommands } from './executor.js';
 import { collectReturns } from './collect.js';
 import { AxeBuilder } from '@axe-core/playwright';
@@ -15,8 +16,30 @@ const MAX_WORKERS = Number(process.env.SITE_EYES_WORKERS || 3);
 const JOB_TIMEOUT_MS = Number(process.env.SITE_EYES_JOB_TIMEOUT_MS || 90000);
 const TOKEN_FILE = process.env.SITE_EYES_TOKEN_FILE || '/mnt/shared/app/.token';
 const RECENT_MAX = Number(process.env.SITE_EYES_RECENT || 200);
+// local disk only: SQLite locking is unreliable on network filesystems such as the Pi's NFS share
+const MEMO_DB = process.env.SITE_EYES_MEMOISE_DB || '/var/lib/site-eyes/memoise.db';
 
 const token = (await fs.readFile(TOKEN_FILE, 'utf8')).trim();
+
+// one row per distinct /check request, naming the job that answered it last
+await fs.mkdir(path.dirname(MEMO_DB), { recursive: true });
+const memoDb = new DatabaseSync(MEMO_DB);
+memoDb.exec(`
+  PRAGMA journal_mode = WAL;
+  CREATE TABLE IF NOT EXISTS memo (
+    key         TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    stored_at   INTEGER NOT NULL,
+    duration_ms INTEGER,
+    results     TEXT,
+    return_keys TEXT NOT NULL
+  );
+`);
+const memoGet = memoDb.prepare('SELECT * FROM memo WHERE key = ?');
+const memoPut = memoDb.prepare(
+  'INSERT OR REPLACE INTO memo (key, job_id, url, stored_at, duration_ms, results, return_keys) VALUES (?, ?, ?, ?, ?, ?, ?)',
+);
 
 // in-flight jobs, and a ring buffer of the last RECENT_MAX finished ones
 const running = new Map();
@@ -163,6 +186,42 @@ app.get('/ui/api/jobs/:jobId/:file', async (req, reply) => {
   return reply.type(MIME[path.extname(file).toLowerCase()] || 'application/octet-stream').send(buf);
 });
 
+// ---- /check?memoise=1: opt in, returns the stored result of an identical earlier request ----
+
+// JSON with sorted keys, so the same request always hashes the same
+const canonical = (v) => (Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
+  : v && typeof v === 'object' ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
+    : JSON.stringify(v ?? null));
+
+const memoKey = (body, commands, returnsSpec) => crypto.createHash('sha256').update(canonical({
+  url: body.url, commands, returns: returnsSpec, cookies: body.cookies || [], viewport: body.viewport || null, timeout: body.timeout || null,
+})).digest('hex');
+
+// The job folder holds the data; the row only names the job. A missing file is a miss.
+async function memoRead(key) {
+  const row = memoGet.get(key);
+  if (!row) return null;
+  const jobDir = path.join(JOBS_DIR, row.job_id);
+  const returns = {};
+  try {
+    for (const k of JSON.parse(row.return_keys)) {
+      if (k === 'html') returns.html = await fs.readFile(path.join(jobDir, 'content.html'), 'utf8');
+      else returns[k] = JSON.parse(await fs.readFile(path.join(jobDir, `${k}.json`), 'utf8'));
+    }
+  } catch { return null; }
+  return {
+    ok: true, jobId: row.job_id, url: row.url, artifactsDir: jobDir, durationMs: row.duration_ms,
+    results: JSON.parse(row.results), returns, memoised: true,
+  };
+}
+
+// best effort: a failed write must not fail a capture that already worked
+function memoWrite(key, jobId, url, durationMs, results, returnKeys) {
+  try {
+    memoPut.run(key, jobId, url, Date.now(), durationMs, JSON.stringify(results), JSON.stringify(returnKeys));
+  } catch {}
+}
+
 app.post('/check', async (req, reply) => {
   const body = req.body || {};
   if (!body.url) return reply.code(400).send({ ok: false, error: 'url required' });
@@ -171,6 +230,12 @@ app.post('/check', async (req, reply) => {
   const timeout = Number(body.timeout || 30000);
   const wantHeaders = !!returnsSpec.headers;
   const wantCoverage = !!returnsSpec.coverage;
+
+  const key = memoKey(body, commands, returnsSpec);
+  if (req.query.memoise !== undefined) {
+    const hit = await memoRead(key);
+    if (hit) return hit;
+  }
 
   const jobId = `${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}`;
   const jobDir = path.join(JOBS_DIR, jobId);
@@ -249,8 +314,11 @@ app.post('/check', async (req, reply) => {
       else await fs.writeFile(path.join(jobDir, `${k}.json`), JSON.stringify(v, null, 2));
     }
 
+    const durationMs = Date.now() - started;
+    memoWrite(key, jobId, body.url, durationMs, results, Object.keys(returns));
+
     jobEnd(jobId, true);
-    return { ok: true, jobId, url: body.url, artifactsDir: jobDir, durationMs: Date.now() - started, results, returns };
+    return { ok: true, jobId, url: body.url, artifactsDir: jobDir, durationMs, results, returns };
   } catch (err) {
     reply.code(500);
     jobEnd(jobId, false, String((err && err.message) || err));
