@@ -5,6 +5,7 @@ import { chromium } from 'playwright';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { runCommands } from './executor.js';
 import { collectReturns } from './collect.js';
 import { AxeBuilder } from '@axe-core/playwright';
@@ -15,9 +16,30 @@ const MAX_WORKERS = Number(process.env.SITE_EYES_WORKERS || 3);
 const JOB_TIMEOUT_MS = Number(process.env.SITE_EYES_JOB_TIMEOUT_MS || 90000);
 const TOKEN_FILE = process.env.SITE_EYES_TOKEN_FILE || '/mnt/shared/app/.token';
 const RECENT_MAX = Number(process.env.SITE_EYES_RECENT || 200);
-const CACHE_DIR = process.env.SITE_EYES_CACHE || path.join(path.dirname(JOBS_DIR), 'cache');
+// local disk only: SQLite locking is unreliable on network filesystems such as the Pi's NFS share
+const MEMO_DB = process.env.SITE_EYES_MEMOISE_DB || '/var/lib/site-eyes/memoise.db';
 
 const token = (await fs.readFile(TOKEN_FILE, 'utf8')).trim();
+
+// one row per distinct /check request, naming the job that answered it last
+await fs.mkdir(path.dirname(MEMO_DB), { recursive: true });
+const memoDb = new DatabaseSync(MEMO_DB);
+memoDb.exec(`
+  PRAGMA journal_mode = WAL;
+  CREATE TABLE IF NOT EXISTS memo (
+    key         TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL,
+    url         TEXT NOT NULL,
+    stored_at   INTEGER NOT NULL,
+    duration_ms INTEGER,
+    results     TEXT,
+    return_keys TEXT NOT NULL
+  );
+`);
+const memoGet = memoDb.prepare('SELECT * FROM memo WHERE key = ?');
+const memoPut = memoDb.prepare(
+  'INSERT OR REPLACE INTO memo (key, job_id, url, stored_at, duration_ms, results, return_keys) VALUES (?, ?, ?, ?, ?, ?, ?)',
+);
 
 // in-flight jobs, and a ring buffer of the last RECENT_MAX finished ones
 const running = new Map();
@@ -164,43 +186,42 @@ app.get('/ui/api/jobs/:jobId/:file', async (req, reply) => {
   return reply.type(MIME[path.extname(file).toLowerCase()] || 'application/octet-stream').send(buf);
 });
 
-// ---- /check memoise: one small index per request, pointing at the job that answered it ----
+// ---- /check?memoise=1: opt in, returns the stored result of an identical earlier request ----
 
 // JSON with sorted keys, so the same request always hashes the same
 const canonical = (v) => (Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map((k) => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
     : JSON.stringify(v ?? null));
 
-const cacheKey = (body, commands, returnsSpec) => crypto.createHash('sha256').update(canonical({
+const memoKey = (body, commands, returnsSpec) => crypto.createHash('sha256').update(canonical({
   url: body.url, commands, returns: returnsSpec, cookies: body.cookies || [], viewport: body.viewport || null, timeout: body.timeout || null,
 })).digest('hex');
 
-// The job folder holds the data; the index only says which job and when. A missing file is a miss.
-async function cacheRead(key, maxAgeSeconds) {
-  let entry;
-  try { entry = JSON.parse(await fs.readFile(path.join(CACHE_DIR, `${key}.json`), 'utf8')); } catch { return null; }
-  const ageSeconds = Math.floor((Date.now() - entry.storedAt) / 1000);
-  if (ageSeconds > maxAgeSeconds) return null;
-  const jobDir = path.join(JOBS_DIR, entry.jobId);
+// The job folder holds the data; the row only names the job. A missing file is a miss.
+async function memoRead(key) {
+  const row = memoGet.get(key);
+  if (!row) return null;
+  const jobDir = path.join(JOBS_DIR, row.job_id);
   const returns = {};
   try {
-    for (const k of entry.returnKeys) {
+    for (const k of JSON.parse(row.return_keys)) {
       if (k === 'html') returns.html = await fs.readFile(path.join(jobDir, 'content.html'), 'utf8');
       else returns[k] = JSON.parse(await fs.readFile(path.join(jobDir, `${k}.json`), 'utf8'));
     }
   } catch { return null; }
-  return { ok: true, jobId: entry.jobId, url: entry.url, artifactsDir: jobDir, durationMs: entry.durationMs, results: entry.results, returns, cached: true, ageSeconds };
+  return {
+    ok: true, jobId: row.job_id, url: row.url, artifactsDir: jobDir, durationMs: row.duration_ms,
+    results: JSON.parse(row.results), returns, memoised: true,
+  };
 }
 
-// best effort: a full disk must not fail a capture that already worked
-async function cacheWrite(key, entry) {
+// best effort: a failed write must not fail a capture that already worked
+function memoWrite(key, jobId, url, durationMs, results, returnKeys) {
   try {
-    await fs.mkdir(CACHE_DIR, { recursive: true });
-    await fs.writeFile(path.join(CACHE_DIR, `${key}.json`), JSON.stringify(entry));
+    memoPut.run(key, jobId, url, Date.now(), durationMs, JSON.stringify(results), JSON.stringify(returnKeys));
   } catch {}
 }
 
-// POST /check?cache=<seconds> answers from the last identical request if it is younger than that
 app.post('/check', async (req, reply) => {
   const body = req.body || {};
   if (!body.url) return reply.code(400).send({ ok: false, error: 'url required' });
@@ -210,10 +231,9 @@ app.post('/check', async (req, reply) => {
   const wantHeaders = !!returnsSpec.headers;
   const wantCoverage = !!returnsSpec.coverage;
 
-  const key = cacheKey(body, commands, returnsSpec);
-  const maxAge = Number(req.query.cache) || 0;
-  if (maxAge > 0) {
-    const hit = await cacheRead(key, maxAge);
+  const key = memoKey(body, commands, returnsSpec);
+  if (req.query.memoise !== undefined) {
+    const hit = await memoRead(key);
     if (hit) return hit;
   }
 
@@ -295,10 +315,10 @@ app.post('/check', async (req, reply) => {
     }
 
     const durationMs = Date.now() - started;
-    await cacheWrite(key, { jobId, storedAt: Date.now(), url: body.url, durationMs, results, returnKeys: Object.keys(returns) });
+    memoWrite(key, jobId, body.url, durationMs, results, Object.keys(returns));
 
     jobEnd(jobId, true);
-    return { ok: true, jobId, url: body.url, artifactsDir: jobDir, durationMs, results, returns, cached: false };
+    return { ok: true, jobId, url: body.url, artifactsDir: jobDir, durationMs, results, returns };
   } catch (err) {
     reply.code(500);
     jobEnd(jobId, false, String((err && err.message) || err));
