@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>site-eyes</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --ink: #14181f; --muted: #6b7480;
+    --line: #dfe3e8; --ok: #1f7a3d; --bad: #b3261e; --busy: #8a5a00;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14181d; --panel:#1c2128; --ink:#e6e9ee; --muted:#8b949e;
+            --line:#2d333b; --ok:#4ac26b; --bad:#f47067; --busy:#d9a441; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; flex-wrap:wrap;
+           padding:14px 18px; border-bottom:1px solid var(--line); background:var(--panel); }
+  h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:.2px; }
+  h2 { font-size:13px; margin:0 0 8px; font-weight:600; text-transform:uppercase;
+       letter-spacing:.6px; color:var(--muted); }
+  .pill { font:12px/1 var(--mono); padding:5px 9px; border-radius:999px;
+          border:1px solid var(--line); color:var(--muted); }
+  .pill.ok { color:var(--ok); border-color:currentColor; }
+  .pill.bad { color:var(--bad); border-color:currentColor; }
+  /* minmax(0,1fr) + min-width:0 stop a wide table stretching the grid track and
+     scrolling the whole page sideways — the .wrap scrolls instead. */
+  main { padding:18px; display:grid; grid-template-columns:minmax(0,1fr); gap:18px; max-width:1400px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; min-width:0; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th { text-align:left; font-weight:600; color:var(--muted); font-size:11px;
+       text-transform:uppercase; letter-spacing:.5px; padding:6px 8px;
+       border-bottom:1px solid var(--line); }
+  td { padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  tr:last-child td { border-bottom:0; }
+  .id { font-family:var(--mono); font-size:12px; white-space:nowrap; }
+  .url { word-break:break-all; }
+  .num { text-align:right; font-family:var(--mono); white-space:nowrap; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .busy { color:var(--busy); }
+  .muted { color:var(--muted); }
+  .empty { color:var(--muted); padding:10px 8px; font-style:italic; }
+  button, input { font:inherit; color:inherit; background:var(--bg);
+                  border:1px solid var(--line); border-radius:6px; padding:6px 10px; }
+  button { cursor:pointer; }
+  button:hover:not(:disabled) { border-color:var(--muted); }
+  button:disabled { opacity:.45; cursor:default; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  .row input { flex:1; min-width:180px; }
+  .link { cursor:pointer; text-decoration:underline; text-underline-offset:2px; }
+  .files { display:flex; gap:6px; flex-wrap:wrap; }
+  .files a { font-family:var(--mono); font-size:11px; color:var(--muted);
+             border:1px solid var(--line); border-radius:4px; padding:1px 5px; text-decoration:none; }
+  .files a:hover { color:var(--ink); border-color:var(--muted); }
+  #detail { background:var(--bg); border:1px solid var(--line); border-radius:6px;
+            padding:10px; overflow:auto; max-height:420px; max-width:100%; margin:12px 0 0; }
+  #detail p { margin:0 0 4px; }
+  #detail a { color:inherit; font-family:var(--mono); font-size:12px; }
+  .wrap { overflow-x:auto; max-width:100%; }
+  .files { max-height:3.4em; overflow-y:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>site-eyes</h1>
+  <span class="pill" id="health">connecting…</span>
+  <span class="pill" id="pool"></span>
+  <span class="pill muted" id="host"></span>
+</header>
+
+<main>
+  <section>
+    <h2>Running now</h2>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Job</th><th>Kind</th><th>URL</th><th class="num">Elapsed</th></tr></thead>
+        <tbody id="running"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Recent — since this process started</h2>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Job</th><th>Kind</th><th>URL</th><th class="num">Took</th><th>Result</th></tr></thead>
+        <tbody id="recent"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>All jobs on disk</h2>
+    <div class="row">
+      <input id="q" placeholder="filter job id (e.g. 2026-08-28)">
+      <button id="prev">◀ newer</button>
+      <button id="next">older ▶</button>
+      <span class="muted" id="paging"></span>
+    </div>
+    <div class="wrap">
+      <table>
+        <thead><tr><th>Job</th><th class="num">Files</th><th>Artifacts</th></tr></thead>
+        <tbody id="jobs"></tbody>
+      </table>
+    </div>
+    <div id="detail" hidden></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const ms = (n) => n == null ? '—' : n < 1000 ? n + 'ms' : (n / 1000).toFixed(1) + 's';
+
+// paths are relative so this works under any nginx sub-path
+const api = (p) => new URL(p, location.href.replace(/[^/]*$/, '')).toString();
+
+let offset = 0, limit = 50, total = 0, q = '';
+
+async function poll() {
+  try {
+    const s = await (await fetch(api('api/state'))).json();
+    $('health').textContent = s.ok ? 'browser ok' : 'browser DOWN';
+    $('health').className = 'pill ' + (s.ok ? 'ok' : 'bad');
+    $('pool').textContent = `${s.active}/${s.max} workers` + (s.queued ? ` · ${s.queued} queued` : '');
+
+    $('running').innerHTML = s.running.length ? s.running.map((j) => `
+      <tr><td class="id">${esc(j.jobId)}</td><td>${esc(j.kind)}</td>
+          <td class="url">${esc(j.url)}</td>
+          <td class="num busy">${ms(s.now - j.startedAt)}</td></tr>`).join('')
+      : '<tr><td colspan="4" class="empty">idle</td></tr>';
+
+    $('recent').innerHTML = s.recent.length ? s.recent.map((j) => `
+      <tr><td class="id link" data-job="${esc(j.jobId)}">${esc(j.jobId)}</td>
+          <td>${esc(j.kind)}</td><td class="url">${esc(j.url)}</td>
+          <td class="num">${ms(j.durationMs)}</td>
+          <td class="${j.ok ? 'ok' : 'bad'}">${j.ok ? 'ok' : esc(j.error || 'failed')}</td></tr>`).join('')
+      : '<tr><td colspan="5" class="empty">nothing yet</td></tr>';
+  } catch (e) {
+    $('health').textContent = 'unreachable';
+    $('health').className = 'pill bad';
+  }
+}
+
+async function loadJobs() {
+  const r = await (await fetch(api(`api/jobs?limit=${limit}&offset=${offset}&q=${encodeURIComponent(q)}`))).json();
+  total = r.total;
+  $('paging').textContent = `${total.toLocaleString()} jobs · showing ${offset + 1}–${Math.min(offset + limit, total)}`;
+  $('prev').disabled = offset === 0;
+  $('next').disabled = offset + limit >= total;
+  $('jobs').innerHTML = r.jobs.length ? r.jobs.map((j) => `
+    <tr><td class="id link" data-job="${esc(j.jobId)}">${esc(j.jobId)}</td>
+        <td class="num">${j.fileCount}</td>
+        <td class="files">${j.files.map((f) => `<a href="${api('api/jobs/' + encodeURIComponent(j.jobId) + '/' + encodeURIComponent(f))}" target="_blank">${esc(f)}</a>`).join('')}</td></tr>`).join('')
+    : '<tr><td colspan="3" class="empty">no jobs match</td></tr>';
+}
+
+const kb = (n) => n < 1024 ? n + ' B' : (n / 1024).toFixed(1) + ' KB';
+
+// Manifest only. A job's network.json alone can be 300 KB — rendering it
+// inline produced a 62,000px tall text node and broke the page.
+async function showJob(jobId) {
+  const d = $('detail');
+  d.hidden = false;
+  d.innerHTML = '<p class="muted">loading ' + esc(jobId) + '…</p>';
+  const r = await (await fetch(api('api/jobs/' + encodeURIComponent(jobId)))).json();
+  if (!r.ok) { d.innerHTML = '<p class="bad">' + esc(r.error || 'not found') + '</p>'; return; }
+  const total = r.files.reduce((n, f) => n + f.bytes, 0);
+  d.innerHTML = `
+    <p class="id">${esc(r.jobId)}</p>
+    <p class="muted">${esc(r.artifactsDir)} · ${r.files.length} files · ${kb(total)}</p>
+    <table>
+      <thead><tr><th>Artifact</th><th class="num">Size</th></tr></thead>
+      <tbody>${r.files.map((f) => `
+        <tr><td><a href="${api('api/jobs/' + encodeURIComponent(r.jobId) + '/' + encodeURIComponent(f.name))}" target="_blank">${esc(f.name)}</a></td>
+            <td class="num">${kb(f.bytes)}</td></tr>`).join('')}
+      </tbody>
+    </table>`;
+  d.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-job]');
+  if (el) showJob(el.dataset.job);
+});
+$('prev').onclick = () => { offset = Math.max(0, offset - limit); loadJobs(); };
+$('next').onclick = () => { offset += limit; loadJobs(); };
+let t; $('q').oninput = (e) => { clearTimeout(t); t = setTimeout(() => { q = e.target.value.trim(); offset = 0; loadJobs(); }, 250); };
+
+$('host').textContent = location.host;
+poll(); loadJobs();
+setInterval(poll, 2000);
+
+// keep the listing live, but only on the newest page with no filter — paging
+// or filtering means the user is reading something and must not be yanked away.
+setInterval(() => { if (offset === 0 && q === '') loadJobs(); }, 5000);
+</script>
+</body>
+</html>

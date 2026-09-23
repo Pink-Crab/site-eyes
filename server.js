@@ -14,8 +14,21 @@ const JOBS_DIR = process.env.SITE_EYES_JOBS || '/mnt/shared/jobs';
 const MAX_WORKERS = Number(process.env.SITE_EYES_WORKERS || 3);
 const JOB_TIMEOUT_MS = Number(process.env.SITE_EYES_JOB_TIMEOUT_MS || 90000);
 const TOKEN_FILE = process.env.SITE_EYES_TOKEN_FILE || '/mnt/shared/app/.token';
+const RECENT_MAX = Number(process.env.SITE_EYES_RECENT || 200);
 
 const token = (await fs.readFile(TOKEN_FILE, 'utf8')).trim();
+
+// in-flight jobs, and a ring buffer of the last RECENT_MAX finished ones
+const running = new Map();
+const recent = [];
+const jobStart = (id, kind, url) => { running.set(id, { jobId: id, kind, url, startedAt: Date.now() }); };
+const jobEnd = (id, ok, error) => {
+  const j = running.get(id);
+  running.delete(id);
+  if (!j) return;
+  recent.unshift({ ...j, ok, error: error || null, durationMs: Date.now() - j.startedAt, finishedAt: Date.now() });
+  if (recent.length > RECENT_MAX) recent.length = RECENT_MAX;
+};
 
 // one browser for the process; each job gets an isolated context, bounded by a semaphore.
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -29,9 +42,13 @@ const release = () => { active--; const next = waiters.shift(); if (next) { acti
 
 const app = Fastify({ logger: true, bodyLimit: 5 * 1024 * 1024 });
 
-// bearer auth on everything except /health
+// bearer auth on everything except /health and the read-only GUI.
+// the GUI is exempt only over loopback — nginx proxies it from 127.0.0.1 behind
+// basic auth, so it never answers unauthenticated to anything off-box.
+const isLoopback = (req) => req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1';
 app.addHook('onRequest', async (req, reply) => {
   if (req.url === '/health') return;
+  if (req.url.startsWith('/ui') && isLoopback(req)) return;
   const auth = req.headers.authorization || '';
   const got = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   const ok = got.length === token.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(token));
@@ -50,9 +67,7 @@ app.get('/health', async (req, reply) => {
 const safeName = (s) => typeof s === 'string' && s.length > 0 && !/[/\\]|\.\./.test(s);
 const MIME = { '.json': 'application/json', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.pdf': 'application/pdf', '.html': 'text/html' };
 
-app.get('/jobs/:jobId', async (req, reply) => {
-  const { jobId } = req.params;
-  if (!safeName(jobId)) return reply.code(400).send({ ok: false, error: 'bad jobId' });
+async function readJob(jobId, reply) {
   const jobDir = path.join(JOBS_DIR, jobId);
   let names;
   try { names = await fs.readdir(jobDir); } catch { return reply.code(404).send({ ok: false, error: 'job not found' }); }
@@ -68,10 +83,79 @@ app.get('/jobs/:jobId', async (req, reply) => {
     }
   }
   return { ok: true, jobId, artifactsDir: jobDir, files, data };
+}
+
+app.get('/jobs/:jobId', async (req, reply) => {
+  const { jobId } = req.params;
+  if (!safeName(jobId)) return reply.code(400).send({ ok: false, error: 'bad jobId' });
+  return readJob(jobId, reply);
 });
 
 // GET /jobs/:jobId/:file — stream one artifact raw with its content type
 app.get('/jobs/:jobId/:file', async (req, reply) => {
+  const { jobId, file } = req.params;
+  if (!safeName(jobId) || !safeName(file)) return reply.code(400).send({ ok: false, error: 'bad path' });
+  let buf;
+  try { buf = await fs.readFile(path.join(JOBS_DIR, jobId, file)); } catch { return reply.code(404).send({ ok: false, error: 'not found' }); }
+  return reply.type(MIME[path.extname(file).toLowerCase()] || 'application/octet-stream').send(buf);
+});
+
+// ---- read-only GUI (loopback + nginx basic auth) ----
+
+// canonical path is /ui/ — the page uses relative fetches so it works under any nginx sub-path
+app.get('/ui', async (req, reply) => reply.redirect(301, '/ui/'));
+app.get('/ui/', async (req, reply) => {
+  const html = await fs.readFile(new URL('./public/ui.html', import.meta.url), 'utf8');
+  return reply.type('text/html; charset=utf-8').send(html);
+});
+
+// current: what the pool is doing right now, plus the recent ring
+app.get('/ui/api/state', async () => ({
+  ok: browser.isConnected(),
+  active,
+  max: MAX_WORKERS,
+  queued: waiters.length,
+  now: Date.now(),
+  running: [...running.values()].sort((a, b) => a.startedAt - b.startedAt),
+  recent,
+}));
+
+// past: paged listing straight off the jobs dir, newest first (ids sort chronologically)
+app.get('/ui/api/jobs', async (req) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 200);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const q = (req.query.q || '').trim();
+  let names = await fs.readdir(JOBS_DIR).catch(() => []);
+  names = names.filter((n) => safeName(n)).sort().reverse();
+  if (q) names = names.filter((n) => n.includes(q));
+  const page = names.slice(offset, offset + limit);
+  const jobs = [];
+  for (const name of page) {
+    const files = await fs.readdir(path.join(JOBS_DIR, name)).catch(() => []);
+    const st = await fs.stat(path.join(JOBS_DIR, name)).catch(() => null);
+    jobs.push({ jobId: name, at: st ? st.mtimeMs : null, fileCount: files.length, files });
+  }
+  return { ok: true, total: names.length, offset, limit, jobs };
+});
+
+// The GUI gets the manifest only — never the inlined data. A job with
+// network.json + coverage.json is hundreds of KB, which is unreadable as one
+// blob and big enough to wreck the page. Individual files are one click away.
+app.get('/ui/api/jobs/:jobId', async (req, reply) => {
+  const { jobId } = req.params;
+  if (!safeName(jobId)) return reply.code(400).send({ ok: false, error: 'bad jobId' });
+  const jobDir = path.join(JOBS_DIR, jobId);
+  let names;
+  try { names = await fs.readdir(jobDir); } catch { return reply.code(404).send({ ok: false, error: 'job not found' }); }
+  const files = [];
+  for (const name of names.sort()) {
+    const st = await fs.stat(path.join(jobDir, name)).catch(() => null);
+    if (st && st.isFile()) files.push({ name, bytes: st.size });
+  }
+  return { ok: true, jobId, artifactsDir: jobDir, files };
+});
+
+app.get('/ui/api/jobs/:jobId/:file', async (req, reply) => {
   const { jobId, file } = req.params;
   if (!safeName(jobId) || !safeName(file)) return reply.code(400).send({ ok: false, error: 'bad path' });
   let buf;
@@ -92,10 +176,14 @@ app.post('/check', async (req, reply) => {
   const jobDir = path.join(JOBS_DIR, jobId);
   await fs.mkdir(jobDir, { recursive: true });
 
+  // Watch the RESPONSE, not the request: node fires 'close' on the request stream as
+  // soon as the body has been read, so a request-side listener marks every caller as
+  // gone before the job starts. That is what made /a11y refuse every request.
   let clientGone = false;
-  req.raw.on('close', () => { if (!reply.sent) clientGone = true; });
+  reply.raw.on('close', () => { if (!reply.sent) clientGone = true; });
 
   await acquire();
+  jobStart(jobId, 'check', body.url);
   const started = Date.now();
   const consoleMsgs = [];
   const network = [];
@@ -114,7 +202,14 @@ app.post('/check', async (req, reply) => {
     }
     const page = await context.newPage();
     page.on('console', (m) => consoleMsgs.push({ type: m.type(), text: m.text() }));
-    page.on('pageerror', (e) => consoleMsgs.push({ type: 'pageerror', text: String(e) }));
+    // String(e) on a thrown plain object collapses to "Object" and loses the lot.
+    page.on('pageerror', (e) => consoleMsgs.push({
+      type: 'pageerror',
+      text: (e && e.message) || String(e),
+      name: e && e.name,
+      stack: e && e.stack,
+      raw: (() => { try { return JSON.stringify(e); } catch { return undefined; } })(),
+    }));
     page.on('requestfinished', async (rq) => {
       try {
         const resp = await rq.response();
@@ -154,13 +249,16 @@ app.post('/check', async (req, reply) => {
       else await fs.writeFile(path.join(jobDir, `${k}.json`), JSON.stringify(v, null, 2));
     }
 
+    jobEnd(jobId, true);
     return { ok: true, jobId, url: body.url, artifactsDir: jobDir, durationMs: Date.now() - started, results, returns };
   } catch (err) {
     reply.code(500);
+    jobEnd(jobId, false, String((err && err.message) || err));
     return { ok: false, jobId, artifactsDir: jobDir, error: String((err && err.message) || err) };
   } finally {
     if (watchdog) clearTimeout(watchdog);
     if (context) await context.close().catch(() => {});
+    running.delete(jobId);
     release();
   }
 });
@@ -174,10 +272,15 @@ app.post('/a11y', async (req, reply) => {
   const timeout = Number(body.timeout || 30000);
   const maxNodes = 50;
 
+  // Watch the RESPONSE, not the request: node fires 'close' on the request stream as
+  // soon as the body has been read, so a request-side listener marks every caller as
+  // gone before the job starts. That is what made /a11y refuse every request.
   let clientGone = false;
-  req.raw.on('close', () => { if (!reply.sent) clientGone = true; });
+  reply.raw.on('close', () => { if (!reply.sent) clientGone = true; });
 
+  const a11yId = `a11y-${new Date().toISOString().replace(/[:.]/g, '-')}-${crypto.randomBytes(3).toString('hex')}`;
   await acquire();
+  jobStart(a11yId, 'a11y', body.url);
   const started = Date.now();
   let context = null;
   let watchdog = null;
@@ -198,6 +301,7 @@ app.post('/a11y', async (req, reply) => {
     }));
     const incomplete = (results.incomplete || []).map((i) => ({ id: i.id, impact: i.impact || null, nodeCount: (i.nodes || []).length }));
 
+    jobEnd(a11yId, true);
     return {
       ok: true, url: body.url, finalUrl: page.url(), durationMs: Date.now() - started,
       engine: results.testEngine, violations, incomplete,
@@ -205,10 +309,12 @@ app.post('/a11y', async (req, reply) => {
     };
   } catch (err) {
     reply.code(500);
+    jobEnd(a11yId, false, String((err && err.message) || err));
     return { ok: false, url: body.url, error: String((err && err.message) || err) };
   } finally {
     if (watchdog) clearTimeout(watchdog);
     if (context) await context.close().catch(() => {});
+    running.delete(a11yId);
     release();
   }
 });
