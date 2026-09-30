@@ -68,21 +68,35 @@ const siteHost = (u) => { try { return new URL(u).hostname.replace(/^www\./, '')
 
 // CDP Fetch hook: the caller's `headers` go to the page's own host only (www or not), and for returns.raw the first
 // document's bytes are kept as received. response.body() gives them after charset decoding and XSLT; context.route() turns the cache off.
-async function intercept(cdp, url, headers, wantRaw) {
+// documentOnly fails every request that is not a document, so a file probe costs the site one request.
+async function intercept(cdp, url, headers, wantRaw, documentOnly) {
   const extra = headers && typeof headers === 'object'
     ? Object.entries(headers).map(([name, value]) => ({ name, value: String(value) })) : [];
   const host = siteHost(url);
   const patterns = [];
-  if (extra.length && host) {
+  // documentOnly pauses every request, so the `headers` host check moves into the handler
+  if (documentOnly) {
+    patterns.push({ urlPattern: '*', requestStage: 'Request' });
+  } else if (extra.length && host) {
     for (const h of [host, `www.${host}`]) patterns.push({ urlPattern: `*://${h}/*`, requestStage: 'Request' });
   }
   if (wantRaw) patterns.push({ urlPattern: '*', resourceType: 'Document', requestStage: 'Response' });
   const captured = { body: null, error: null };
   if (!patterns.length) return captured;
   const names = new Set(extra.map((h) => h.name.toLowerCase()));
+  // the page's own host, www or not, port included
+  const ownHost = (u) => { try { return !!host && [host, `www.${host}`].includes(new URL(u).host); } catch { return false; } };
   cdp.on('Fetch.requestPaused', async (e) => {
     try {
       if (e.responseStatusCode === undefined && e.responseErrorReason === undefined) {
+        if (documentOnly && e.resourceType !== 'Document') {
+          await cdp.send('Fetch.failRequest', { requestId: e.requestId, errorReason: 'BlockedByClient' });
+          return;
+        }
+        if (documentOnly && !(extra.length && ownHost(e.request.url))) {
+          await cdp.send('Fetch.continueRequest', { requestId: e.requestId });
+          return;
+        }
         const kept = Object.entries(e.request.headers).filter(([k]) => !names.has(k.toLowerCase())).map(([name, value]) => ({ name, value }));
         await cdp.send('Fetch.continueRequest', { requestId: e.requestId, headers: [...kept, ...extra] });
         return;
@@ -101,7 +115,7 @@ async function intercept(cdp, url, headers, wantRaw) {
   return captured;
 }
 
-// returns.raw: the first navigation's status, headers and redirect hops, with the body intercept() kept
+// returns.raw: the first navigation's status, headers, redirect hops, timing and server address, with the body intercept() kept
 async function rawResponse(nav, error, captured) {
   if (!nav) return { ok: false, error: error || 'no response' };
   const redirects = [];
@@ -110,10 +124,13 @@ async function rawResponse(nav, error, captured) {
     redirects.unshift({ url: rq.url(), status: r ? r.status() : null, location: r ? r.headers().location || null : null });
   }
   const headers = await nav.allHeaders().catch(() => nav.headers());
+  const serverAddr = await nav.serverAddr().catch(() => null);
   const body = captured.body;
   return {
     ok: body !== null, url: nav.url(), status: nav.status(), statusText: nav.statusText(),
     contentType: headers['content-type'] || null, headers, redirects,
+    // Playwright's request timing: ms from startTime, -1 when not available
+    timing: nav.request().timing(), serverAddr,
     bytes: body ? body.length : 0, body: body ? body.toString('base64') : null,
     ...(captured.error ? { error: captured.error } : {}),
   };
@@ -256,8 +273,9 @@ const canonical = (v) => (Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
 
 const memoKey = (body, commands, returnsSpec) => crypto.createHash('sha256').update(canonical({
   url: body.url, commands, returns: returnsSpec, cookies: body.cookies || [], viewport: body.viewport || null, timeout: body.timeout || null,
-  // only when sent, so keys stored before headers existed still match
+  // only when sent, so keys stored before these existed still match
   ...(body.headers ? { headers: body.headers } : {}),
+  ...(body.documentOnly ? { documentOnly: true } : {}),
 })).digest('hex');
 
 // The job folder holds the data; the row only names the job. A missing file is a miss.
@@ -354,7 +372,7 @@ app.post('/check', async (req, reply) => {
       } catch {}
     });
     const cdp = await context.newCDPSession(page);
-    const captured = await intercept(cdp, body.url, body.headers, !!returnsSpec.raw);
+    const captured = await intercept(cdp, body.url, body.headers, !!returnsSpec.raw, !!body.documentOnly);
 
     // coverage must start before navigation
     if (wantCoverage) {

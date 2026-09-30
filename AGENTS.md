@@ -24,7 +24,7 @@ the job is killed.
 
 `?memoise=1` (opt in) answers from the last identical successful request (same
 `url`, `commands`, `returns`, `cookies`, `viewport`, `timeout`, and `headers`
-when sent) without opening
+and `documentOnly` when sent) without opening
 a browser. That response has `memoised: true` and the original `jobId`. With no
 earlier match, or without the parameter, the call runs as normal.
 
@@ -132,10 +132,38 @@ Real response (a live e-commerce site, arrays trimmed to one element):
 | `domStats` | `{nodes, maxDepth, htmlBytes}` |
 | `brokenImages` | `[{src, alt}]` for `<img>` with `naturalWidth === 0` |
 | `cdp` | `[{method, result}]` or `[{method, error}]` — any raw DevTools call |
-| `raw` | `{ok, url, status, statusText, contentType, headers:{...}, redirects:[{url, status, location}], bytes, body}` — the first document response; `body` is base64 of the bytes as received (before charset decoding or XSLT); `ok:false` + `error` when it could not be read |
+| `raw` | `{ok, url, status, statusText, contentType, headers:{...}, redirects:[{url, status, location}], timing:{...}, serverAddr:{ipAddress, port}, bytes, body}` — the first document response; `body` is base64 of the bytes as received (before charset decoding or XSLT); `timing` is Playwright's `request.timing()` and `serverAddr` its `response.serverAddr()`, both for the final (non-redirect) response; `ok:false` + `error` when it could not be read |
+
+Real `raw.timing` and `raw.serverAddr` (`/check` on `https://bedsbirdclub.org.uk/wp-includes/css/dist/block-library/style.min.css`):
+
+```jsonc
+"timing": { "startTime": 1790734706287.871, "domainLookupStart": 0.292, "domainLookupEnd": 2.776,
+            "connectStart": 2.848, "secureConnectionStart": 22.011, "connectEnd": 41.747,
+            "requestStart": 41.884, "responseStart": 66.775, "responseEnd": 77.502 },
+"serverAddr": { "ipAddress": "199.16.172.193", "port": 443 }
+```
+
+`timing.startTime` is epoch ms; every other `timing` field is ms after `startTime`,
+`-1` when not available. `serverAddr` is `null` when the address is not known.
 
 Request `headers` (`/check` and `/a11y`): `{name: value}` added only to requests
 for the page's own host, with or without `www`. Third-party requests never get them.
+
+Request `documentOnly: true` (`/check` only): every request that is not a
+document is failed before it is sent, on every host, so a raw file probe costs
+the site one request, like `curl`. `headers` still go to the page's own host.
+Real `network` from a 404 HTML page with it on (41 entries: the document, and
+40 blocked like the stylesheet here):
+
+```jsonc
+[
+  { "url": "https://bedsbirdclub.org.uk/wp-content/themes/bedfordshirebirdsclub/style.css?ver=1787092121", "method": "GET",
+    "type": "stylesheet", "status": null, "failed": true, "errorText": "net::ERR_BLOCKED_BY_CLIENT.Inspector",
+    "startMs": 0, "durationMs": null, "category": "CSS" },
+  { "url": "https://bedsbirdclub.org.uk/llms.txt", "method": "GET", "type": "document", "status": 404,
+    "startMs": 1790734706551.2388, "durationMs": 835, "category": "Doc" }
+]
+```
 
 Persistence: every requested key is also written to the job dir as
 `<key>.json`; fetch old jobs with `GET /jobs/<jobId>` (all JSON inlined under

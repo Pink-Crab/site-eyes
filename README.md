@@ -39,12 +39,19 @@ Two independent parts:
   `metrics`, `coverage` (unused CSS/JS bytes), `axTree`, `html`, `snippets`,
   `seo`, `domStats`, `brokenImages`, `raw` (the first response exactly as
   the server sent it: status, headers, redirect hops, body as base64, before
-  any charset decoding or XSLT), and a raw `cdp` escape hatch into the full
+  any charset decoding or XSLT, plus the request's `timing` and the server's
+  IP and port as `serverAddr`), and a raw `cdp` escape hatch into the full
   Chrome DevTools Protocol.
 
 Optional **`headers`** (`{name: value}`, also on `/a11y`) are added to requests
 for the page's own host only, with or without `www`. Third-party requests never
 get them, and the browser cache stays on.
+
+Optional **`documentOnly: true`** (`/check` only) fails every request that is
+not a document before it is sent, on every host, so probing a file with
+`returns.raw` costs the site one request, like `curl`. Blocked requests show in
+`network` with `failed: true` and `errorText: "net::ERR_BLOCKED_BY_CLIENT.Inspector"`.
+`headers` still reach the page's own host.
 
 ```bash
 curl -s -X POST http://localhost:8080/check \
@@ -65,7 +72,7 @@ added. If there is none, the call runs as normal. Without the parameter
 nothing changes.
 
 "Identical" means the same `url`, `commands`, `returns`, `cookies`, `viewport`,
-`timeout` and `headers` (when sent), compared with keys sorted. Every successful `/check` is indexed
+`timeout`, and `headers` and `documentOnly` (when sent), compared with keys sorted. Every successful `/check` is indexed
 in a SQLite table at `SITE_EYES_MEMOISE_DB` (one row per distinct request,
 naming its latest job); the data itself is read back from that job's folder,
 so nothing is stored twice. If any of the job's files are gone, the call runs
