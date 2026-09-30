@@ -54,9 +54,15 @@ const jobEnd = (id, ok, error) => {
 };
 
 // one browser for the process; each job gets an isolated context, bounded by a semaphore.
-const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+const browser = await chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'] });
 // if the shared browser dies (e.g. OOM), exit — systemd relaunches us clean
 browser.on('disconnected', () => process.exit(1));
+
+// present as a normal UK Chrome: real version, no "HeadlessChrome", en-GB, London time
+const probe = await browser.newPage();
+const USER_AGENT = (await probe.evaluate(() => navigator.userAgent)).replace('HeadlessChrome', 'Chrome');
+await probe.close();
+const CONTEXT_OPTS = { userAgent: USER_AGENT, locale: 'en-GB', timezoneId: 'Europe/London', ignoreHTTPSErrors: true };
 
 let active = 0;
 const waiters = [];
@@ -256,7 +262,7 @@ app.post('/check', async (req, reply) => {
   let watchdog = null;
   try {
     if (clientGone) return { ok: false, jobId, error: 'client disconnected while queued' };
-    context = await browser.newContext({ viewport: body.viewport || { width: 1366, height: 768 }, ignoreHTTPSErrors: true });
+    context = await browser.newContext({ ...CONTEXT_OPTS, viewport: body.viewport || { width: 1366, height: 768 } });
     // hard cap + caller-gone abort: closing the context makes the job reject, freeing its slot
     const killJob = () => context.close().catch(() => {});
     watchdog = setTimeout(killJob, JOB_TIMEOUT_MS);
@@ -354,7 +360,7 @@ app.post('/a11y', async (req, reply) => {
   let watchdog = null;
   try {
     if (clientGone) return { ok: false, url: body.url, error: 'client disconnected while queued' };
-    context = await browser.newContext({ viewport: body.viewport || { width: 1366, height: 768 }, ignoreHTTPSErrors: true });
+    context = await browser.newContext({ ...CONTEXT_OPTS, viewport: body.viewport || { width: 1366, height: 768 } });
     const killJob = () => context.close().catch(() => {});
     watchdog = setTimeout(killJob, JOB_TIMEOUT_MS);
     req.raw.on('close', () => { if (!reply.sent) killJob(); });
