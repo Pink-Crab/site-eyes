@@ -23,7 +23,7 @@ is in [`AGENTS.md`](AGENTS.md).
 | `GET /health` | none | `{ok, active, max}` — `ok:false` + HTTP 503 when the browser is dead |
 | `GET /jobs/:jobId` | Bearer | a past job with every collected `<key>.json` inlined |
 | `GET /jobs/:jobId/:file` | Bearer | one raw artifact (`page.png`, `content.html`, PDFs, any `<key>.json`) |
-| `POST /a11y` | Bearer | axe-core audit: `{url, timeout?, viewport?}` |
+| `POST /a11y` | Bearer | axe-core audit: `{url, timeout?, viewport?, headers?}` |
 
 ## The `/check` request
 
@@ -37,8 +37,14 @@ Two independent parts:
   category and URL substring), `failures`, `headers`, `mixedContent`,
   `summary`, `cookies`, `storage`, `perf`, `webVitals`, `resources`,
   `metrics`, `coverage` (unused CSS/JS bytes), `axTree`, `html`, `snippets`,
-  `seo`, `domStats`, `brokenImages`, and a raw `cdp` escape hatch into the
-  full Chrome DevTools Protocol.
+  `seo`, `domStats`, `brokenImages`, `raw` (the first response exactly as
+  the server sent it: status, headers, redirect hops, body as base64, before
+  any charset decoding or XSLT), and a raw `cdp` escape hatch into the full
+  Chrome DevTools Protocol.
+
+Optional **`headers`** (`{name: value}`, also on `/a11y`) are added to requests
+for the page's own host only, with or without `www`. Third-party requests never
+get them, and the browser cache stays on.
 
 ```bash
 curl -s -X POST http://localhost:8080/check \
@@ -58,8 +64,8 @@ stored result comes back instead of opening a browser, with `memoised: true`
 added. If there is none, the call runs as normal. Without the parameter
 nothing changes.
 
-"Identical" means the same `url`, `commands`, `returns`, `cookies`, `viewport`
-and `timeout`, compared with keys sorted. Every successful `/check` is indexed
+"Identical" means the same `url`, `commands`, `returns`, `cookies`, `viewport`,
+`timeout` and `headers` (when sent), compared with keys sorted. Every successful `/check` is indexed
 in a SQLite table at `SITE_EYES_MEMOISE_DB` (one row per distinct request,
 naming its latest job); the data itself is read back from that job's folder,
 so nothing is stored twice. If any of the job's files are gone, the call runs

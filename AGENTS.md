@@ -23,7 +23,8 @@ in parallel; extra callers queue. If you disconnect while queued or mid-job,
 the job is killed.
 
 `?memoise=1` (opt in) answers from the last identical successful request (same
-`url`, `commands`, `returns`, `cookies`, `viewport`, `timeout`) without opening
+`url`, `commands`, `returns`, `cookies`, `viewport`, `timeout`, and `headers`
+when sent) without opening
 a browser. That response has `memoised: true` and the original `jobId`. With no
 earlier match, or without the parameter, the call runs as normal.
 
@@ -131,6 +132,10 @@ Real response (a live e-commerce site, arrays trimmed to one element):
 | `domStats` | `{nodes, maxDepth, htmlBytes}` |
 | `brokenImages` | `[{src, alt}]` for `<img>` with `naturalWidth === 0` |
 | `cdp` | `[{method, result}]` or `[{method, error}]` — any raw DevTools call |
+| `raw` | `{ok, url, status, statusText, contentType, headers:{...}, redirects:[{url, status, location}], bytes, body}` — the first document response; `body` is base64 of the bytes as received (before charset decoding or XSLT); `ok:false` + `error` when it could not be read |
+
+Request `headers` (`/check` and `/a11y`): `{name: value}` added only to requests
+for the page's own host, with or without `www`. Third-party requests never get them.
 
 Persistence: every requested key is also written to the job dir as
 `<key>.json`; fetch old jobs with `GET /jobs/<jobId>` (all JSON inlined under
@@ -153,7 +158,7 @@ Treat any `ok:false` as a per-URL failure, not a service failure — record the
 
 ## `/a11y`
 
-`POST /a11y` body `{url, timeout?, viewport?}` → axe-core results:
+`POST /a11y` body `{url, timeout?, viewport?, headers?}` → axe-core results:
 `{ok, url, finalUrl, durationMs, engine:{name,version}, violations:[{id, impact, description, help, helpUrl, nodes:[{target, html, failureSummary}], nodeCount}], incomplete:[…], counts:{violations, incomplete, passes}}`.
 `nodes` is capped at 50 per rule; `impact` ∈ critical|serious|moderate|minor.
 
