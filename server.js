@@ -64,6 +64,61 @@ const USER_AGENT = (await probe.evaluate(() => navigator.userAgent)).replace('He
 await probe.close();
 const CONTEXT_OPTS = { userAgent: USER_AGENT, locale: 'en-GB', timezoneId: 'Europe/London', ignoreHTTPSErrors: true };
 
+const siteHost = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return null; } };
+
+// CDP Fetch hook: the caller's `headers` go to the page's own host only (www or not), and for returns.raw the first
+// document's bytes are kept as received. response.body() gives them after charset decoding and XSLT; context.route() turns the cache off.
+async function intercept(cdp, url, headers, wantRaw) {
+  const extra = headers && typeof headers === 'object'
+    ? Object.entries(headers).map(([name, value]) => ({ name, value: String(value) })) : [];
+  const host = siteHost(url);
+  const patterns = [];
+  if (extra.length && host) {
+    for (const h of [host, `www.${host}`]) patterns.push({ urlPattern: `*://${h}/*`, requestStage: 'Request' });
+  }
+  if (wantRaw) patterns.push({ urlPattern: '*', resourceType: 'Document', requestStage: 'Response' });
+  const captured = { body: null, error: null };
+  if (!patterns.length) return captured;
+  const names = new Set(extra.map((h) => h.name.toLowerCase()));
+  cdp.on('Fetch.requestPaused', async (e) => {
+    try {
+      if (e.responseStatusCode === undefined && e.responseErrorReason === undefined) {
+        const kept = Object.entries(e.request.headers).filter(([k]) => !names.has(k.toLowerCase())).map(([name, value]) => ({ name, value }));
+        await cdp.send('Fetch.continueRequest', { requestId: e.requestId, headers: [...kept, ...extra] });
+        return;
+      }
+      if (captured.body === null && !e.responseErrorReason && !(e.responseStatusCode >= 300 && e.responseStatusCode < 400)) {
+        const r = await cdp.send('Fetch.getResponseBody', { requestId: e.requestId });
+        captured.body = Buffer.from(r.body, r.base64Encoded ? 'base64' : 'utf8');
+      }
+      await cdp.send('Fetch.continueRequest', { requestId: e.requestId });
+    } catch (err) {
+      captured.error = String((err && err.message) || err);
+      cdp.send('Fetch.continueRequest', { requestId: e.requestId }).catch(() => {});
+    }
+  });
+  await cdp.send('Fetch.enable', { patterns });
+  return captured;
+}
+
+// returns.raw: the first navigation's status, headers and redirect hops, with the body intercept() kept
+async function rawResponse(nav, error, captured) {
+  if (!nav) return { ok: false, error: error || 'no response' };
+  const redirects = [];
+  for (let rq = nav.request().redirectedFrom(); rq; rq = rq.redirectedFrom()) {
+    const r = await rq.response().catch(() => null);
+    redirects.unshift({ url: rq.url(), status: r ? r.status() : null, location: r ? r.headers().location || null : null });
+  }
+  const headers = await nav.allHeaders().catch(() => nav.headers());
+  const body = captured.body;
+  return {
+    ok: body !== null, url: nav.url(), status: nav.status(), statusText: nav.statusText(),
+    contentType: headers['content-type'] || null, headers, redirects,
+    bytes: body ? body.length : 0, body: body ? body.toString('base64') : null,
+    ...(captured.error ? { error: captured.error } : {}),
+  };
+}
+
 let active = 0;
 const waiters = [];
 const acquire = () => new Promise((res) => (active < MAX_WORKERS ? (active++, res()) : waiters.push(res)));
@@ -201,6 +256,8 @@ const canonical = (v) => (Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
 
 const memoKey = (body, commands, returnsSpec) => crypto.createHash('sha256').update(canonical({
   url: body.url, commands, returns: returnsSpec, cookies: body.cookies || [], viewport: body.viewport || null, timeout: body.timeout || null,
+  // only when sent, so keys stored before headers existed still match
+  ...(body.headers ? { headers: body.headers } : {}),
 })).digest('hex');
 
 // The job folder holds the data; the row only names the job. A missing file is a miss.
@@ -297,6 +354,7 @@ app.post('/check', async (req, reply) => {
       } catch {}
     });
     const cdp = await context.newCDPSession(page);
+    const captured = await intercept(cdp, body.url, body.headers, !!returnsSpec.raw);
 
     // coverage must start before navigation
     if (wantCoverage) {
@@ -305,7 +363,11 @@ app.post('/check', async (req, reply) => {
     }
 
     // implicit first navigation to the requested url
-    await page.goto(body.url, { waitUntil: 'load', timeout }).catch((e) => consoleMsgs.push({ type: 'goto-error', text: String(e) }));
+    let gotoError = null;
+    const nav = await page.goto(body.url, { waitUntil: 'load', timeout })
+      .catch((e) => { gotoError = String(e); consoleMsgs.push({ type: 'goto-error', text: gotoError }); return null; });
+    // read before the commands run, while the first page is still loaded
+    const raw = returnsSpec.raw ? await rawResponse(nav, gotoError, captured) : null;
 
     const ctx = { url: body.url, timeout, jobDir, console: consoleMsgs, network };
 
@@ -313,6 +375,7 @@ app.post('/check', async (req, reply) => {
     const results = await runCommands(page, commands.map((c, i) => ({ ...c, _i: i })), ctx);
     // 2) collect ONLY the requested DevTools DATA
     const returns = await collectReturns(page, cdp, returnsSpec, ctx);
+    if (raw) returns.raw = raw;
 
     // 3) persist ONLY what was asked for — one file per return key; the rest is dropped
     for (const [k, v] of Object.entries(returns)) {
@@ -365,6 +428,7 @@ app.post('/a11y', async (req, reply) => {
     watchdog = setTimeout(killJob, JOB_TIMEOUT_MS);
     req.raw.on('close', () => { if (!reply.sent) killJob(); });
     const page = await context.newPage();
+    await intercept(await context.newCDPSession(page), body.url, body.headers, false);
     await page.goto(body.url, { waitUntil: 'load', timeout });
     const results = await new AxeBuilder({ page }).analyze();
 
