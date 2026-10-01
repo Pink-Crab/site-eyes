@@ -64,6 +64,23 @@ const USER_AGENT = (await probe.evaluate(() => navigator.userAgent)).replace('He
 await probe.close();
 const CONTEXT_OPTS = { userAgent: USER_AGENT, locale: 'en-GB', timezoneId: 'Europe/London', ignoreHTTPSErrors: true };
 
+// optional per-request locale and timezoneId over CONTEXT_OPTS; the error text when either is invalid, else null
+const localeError = (body) => {
+  if (body.locale !== undefined) {
+    try { if (typeof body.locale !== 'string' || !body.locale || Intl.getCanonicalLocales(body.locale).length !== 1) return 'invalid locale'; } catch { return 'invalid locale'; }
+  }
+  if (body.timezoneId !== undefined) {
+    try { if (typeof body.timezoneId !== 'string' || !body.timezoneId) return 'invalid timezoneId'; new Intl.DateTimeFormat('en', { timeZone: body.timezoneId }); } catch { return 'invalid timezoneId'; }
+  }
+  return null;
+};
+const contextOpts = (body) => ({
+  ...CONTEXT_OPTS,
+  ...(body.locale ? { locale: body.locale } : {}),
+  ...(body.timezoneId ? { timezoneId: body.timezoneId } : {}),
+  viewport: body.viewport || { width: 1366, height: 768 },
+});
+
 const siteHost = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return null; } };
 
 // CDP Fetch hook: the caller's `headers` go to the page's own host only (www or not), and for returns.raw the first
@@ -276,6 +293,8 @@ const memoKey = (body, commands, returnsSpec) => crypto.createHash('sha256').upd
   // only when sent, so keys stored before these existed still match
   ...(body.headers ? { headers: body.headers } : {}),
   ...(body.documentOnly ? { documentOnly: true } : {}),
+  ...(body.locale ? { locale: body.locale } : {}),
+  ...(body.timezoneId ? { timezoneId: body.timezoneId } : {}),
 })).digest('hex');
 
 // The job folder holds the data; the row only names the job. A missing file is a miss.
@@ -306,11 +325,14 @@ function memoWrite(key, jobId, url, durationMs, results, returnKeys) {
 app.post('/check', async (req, reply) => {
   const body = req.body || {};
   if (!body.url) return reply.code(400).send({ ok: false, error: 'url required' });
+  const badLocale = localeError(body);
+  if (badLocale) return reply.code(400).send({ ok: false, error: badLocale });
   const commands = Array.isArray(body.commands) ? body.commands : [];
   const returnsSpec = body.returns && typeof body.returns === 'object' ? body.returns : {};
   const timeout = Number(body.timeout || 30000);
   const wantHeaders = !!returnsSpec.headers;
   const wantCoverage = !!returnsSpec.coverage;
+  const wantInitiators = !!(returnsSpec.network && returnsSpec.network.initiators);
 
   const key = memoKey(body, commands, returnsSpec);
   if (req.query.memoise !== undefined) {
@@ -333,11 +355,17 @@ app.post('/check', async (req, reply) => {
   const started = Date.now();
   const consoleMsgs = [];
   const network = [];
+  // DevTools initiators queued per url (no fragment), taken oldest first as each request ends
+  const initiators = new Map();
+  const initiatorOf = (url) => {
+    const queue = initiators.get(String(url).split('#')[0]);
+    return (queue && queue.shift()) || null;
+  };
   let context = null;
   let watchdog = null;
   try {
     if (clientGone) return { ok: false, jobId, error: 'client disconnected while queued' };
-    context = await browser.newContext({ ...CONTEXT_OPTS, viewport: body.viewport || { width: 1366, height: 768 } });
+    context = await browser.newContext(contextOpts(body));
     // hard cap + caller-gone abort: closing the context makes the job reject, freeing its slot
     const killJob = () => context.close().catch(() => {});
     watchdog = setTimeout(killJob, JOB_TIMEOUT_MS);
@@ -361,18 +389,35 @@ app.post('/check', async (req, reply) => {
         const resp = await rq.response();
         const t = rq.timing();
         const entry = { url: rq.url(), method: rq.method(), type: rq.resourceType(), status: resp ? resp.status() : null, startMs: t.startTime, durationMs: t.responseEnd >= 0 ? Math.round(t.responseEnd) : null };
-        if (wantHeaders && resp) entry.headers = resp.headers();
+        // allHeaders() keeps set-cookie, which headers() leaves out
+        if (wantHeaders && resp) entry.headers = await resp.allHeaders().catch(() => resp.headers());
+        if (wantInitiators) entry.initiator = initiatorOf(entry.url);
         network.push(entry);
       } catch {}
     });
     page.on('requestfailed', (rq) => {
       try {
         const t = rq.timing();
-        network.push({ url: rq.url(), method: rq.method(), type: rq.resourceType(), status: null, failed: true, errorText: (rq.failure() && rq.failure().errorText) || null, startMs: t && t.startTime, durationMs: null });
+        const entry = { url: rq.url(), method: rq.method(), type: rq.resourceType(), status: null, failed: true, errorText: (rq.failure() && rq.failure().errorText) || null, startMs: t && t.startTime, durationMs: null };
+        if (wantInitiators) entry.initiator = initiatorOf(entry.url);
+        network.push(entry);
       } catch {}
     });
     const cdp = await context.newCDPSession(page);
     const captured = await intercept(cdp, body.url, body.headers, !!returnsSpec.raw, !!body.documentOnly);
+
+    // initiators must be listened for before navigation; a script's url comes from the first stack frame that has one
+    if (wantInitiators) {
+      cdp.on('Network.requestWillBeSent', (e) => {
+        const i = e.initiator || {};
+        let frame = null;
+        for (let s = i.stack; s && !frame; s = s.parent) frame = (s.callFrames || []).find((f) => f.url) || null;
+        const url = e.request.url;
+        if (!initiators.has(url)) initiators.set(url, []);
+        initiators.get(url).push({ type: i.type || null, url: i.url || (frame && frame.url) || null });
+      });
+      await cdp.send('Network.enable').catch(() => {});
+    }
 
     // coverage must start before navigation
     if (wantCoverage) {
@@ -424,6 +469,8 @@ app.post('/check', async (req, reply) => {
 app.post('/a11y', async (req, reply) => {
   const body = req.body || {};
   if (!body.url) return reply.code(400).send({ ok: false, error: 'url required' });
+  const badLocale = localeError(body);
+  if (badLocale) return reply.code(400).send({ ok: false, error: badLocale });
   const timeout = Number(body.timeout || 30000);
   const maxNodes = 50;
 
@@ -441,7 +488,7 @@ app.post('/a11y', async (req, reply) => {
   let watchdog = null;
   try {
     if (clientGone) return { ok: false, url: body.url, error: 'client disconnected while queued' };
-    context = await browser.newContext({ ...CONTEXT_OPTS, viewport: body.viewport || { width: 1366, height: 768 } });
+    context = await browser.newContext(contextOpts(body));
     const killJob = () => context.close().catch(() => {});
     watchdog = setTimeout(killJob, JOB_TIMEOUT_MS);
     req.raw.on('close', () => { if (!reply.sent) killJob(); });

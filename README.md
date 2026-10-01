@@ -23,7 +23,7 @@ is in [`AGENTS.md`](AGENTS.md).
 | `GET /health` | none | `{ok, active, max}` — `ok:false` + HTTP 503 when the browser is dead |
 | `GET /jobs/:jobId` | Bearer | a past job with every collected `<key>.json` inlined |
 | `GET /jobs/:jobId/:file` | Bearer | one raw artifact (`page.png`, `content.html`, PDFs, any `<key>.json`) |
-| `POST /a11y` | Bearer | axe-core audit: `{url, timeout?, viewport?, headers?}` |
+| `POST /a11y` | Bearer | axe-core audit: `{url, timeout?, viewport?, headers?, locale?, timezoneId?}` |
 
 ## The `/check` request
 
@@ -53,6 +53,16 @@ not a document before it is sent, on every host, so probing a file with
 `network` with `failed: true` and `errorText: "net::ERR_BLOCKED_BY_CLIENT.Inspector"`.
 `headers` still reach the page's own host.
 
+Optional **`locale`** and **`timezoneId`** (e.g. `"de-DE"`, `"Europe/Berlin"`,
+also on `/a11y`) replace the `en-GB` and `Europe/London` defaults for that job.
+`locale` sets `navigator.language` and `Accept-Language`, so a site that picks
+its language from the browser serves that translation. An invalid value is a
+400. The IP stays the server's.
+
+`"network": { "initiators": true }` adds `initiator: {type, url}` to each
+request: what started it (`parser`, `script`, `preload`, `other`) and the
+document or script it came from.
+
 ```bash
 curl -s -X POST http://localhost:8080/check \
   -H "Authorization: Bearer $(cat .token)" \
@@ -72,7 +82,7 @@ added. If there is none, the call runs as normal. Without the parameter
 nothing changes.
 
 "Identical" means the same `url`, `commands`, `returns`, `cookies`, `viewport`,
-`timeout`, and `headers` and `documentOnly` (when sent), compared with keys sorted. Every successful `/check` is indexed
+`timeout`, and `headers`, `documentOnly`, `locale` and `timezoneId` (when sent), compared with keys sorted. Every successful `/check` is indexed
 in a SQLite table at `SITE_EYES_MEMOISE_DB` (one row per distinct request,
 naming its latest job); the data itself is read back from that job's folder,
 so nothing is stored twice. If any of the job's files are gone, the call runs
