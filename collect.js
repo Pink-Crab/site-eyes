@@ -99,6 +99,7 @@ export async function collectReturns(page, cdp, spec, ctx) {
       const resources = performance.getEntriesByType('resource').map((r) => ({
         name: r.name, type: r.initiatorType, startMs: round(r.startTime), durationMs: round(r.duration),
         transferSize: r.transferSize, encodedBodySize: r.encodedBodySize, decodedBodySize: r.decodedBodySize,
+        renderBlockingStatus: r.renderBlockingStatus,
       }));
       return { navigation, paints, resources };
     });

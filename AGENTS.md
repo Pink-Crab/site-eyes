@@ -23,8 +23,8 @@ in parallel; extra callers queue. If you disconnect while queued or mid-job,
 the job is killed.
 
 `?memoise=1` (opt in) answers from the last identical successful request (same
-`url`, `commands`, `returns`, `cookies`, `viewport`, `timeout`, and `headers`
-and `documentOnly` when sent) without opening
+`url`, `commands`, `returns`, `cookies`, `viewport`, `timeout`, and `headers`,
+`documentOnly`, `locale` and `timezoneId` when sent) without opening
 a browser. That response has `memoised: true` and the original `jobId`. With no
 earlier match, or without the parameter, the call runs as normal.
 
@@ -114,17 +114,21 @@ Real response (a live e-commerce site, arrays trimmed to one element):
 - `network.startMs` is epoch ms; subtract the Doc entry's to build a waterfall.
   Filter server-side instead of pulling everything:
   `"network": { "categories": ["JS","CSS"], "text": "wp-content", "invert": false }`.
+- `"network": { "initiators": true }` adds `initiator: {type, url}` to each entry,
+  from the DevTools `Network.requestWillBeSent` event: `type` is
+  `parser|script|preload|other`, `url` is the document or script that started the
+  request (`null` when Chrome gives none). Off unless asked.
 
 ## Other `returns` keys (shapes from collect.js)
 
 | Key | Shape |
 |---|---|
-| `headers` | `[{url, status, category, headers:{...}}]` — every request's response headers |
+| `headers` | `[{url, status, category, headers:{...}}]` — every request's response headers, `set-cookie` included (several are joined with a newline) |
 | `mixedContent` | `[{url, category}]` — http:// subresources on an https page (empty array on http pages) |
 | `cookies` | Playwright `context().cookies()` array |
 | `storage` | `{localStorage:{k:v}, sessionStorage:{k:v}, indexedDB:[{name,version}]}` |
 | `perf` | `{navigation:{ttfbMs,domInteractiveMs,domContentLoadedMs,loadMs,transferSize,encodedBodySize,decodedBodySize}, paints:[{name,startMs}]}` |
-| `resources` | `[{name,type,startMs,durationMs,transferSize,encodedBodySize,decodedBodySize}]` per resource |
+| `resources` | `[{name,type,startMs,durationMs,transferSize,encodedBodySize,decodedBodySize,renderBlockingStatus}]` per resource; `type` is the Resource Timing `initiatorType`, `renderBlockingStatus` is `blocking` or `non-blocking` |
 | `metrics` | raw CDP `Performance.getMetrics` array `[{name,value}]` |
 | `axTree` | raw CDP `Accessibility.getFullAXTree` nodes |
 | `html` | full post-JS rendered HTML — heavy; request only when needed |
@@ -148,6 +152,12 @@ Real `raw.timing` and `raw.serverAddr` (`/check` on `https://bedsbirdclub.org.uk
 
 Request `headers` (`/check` and `/a11y`): `{name: value}` added only to requests
 for the page's own host, with or without `www`. Third-party requests never get them.
+
+Request `locale` and `timezoneId` (`/check` and `/a11y`, optional): e.g. `"de-DE"`
+and `"Europe/Berlin"`, for that job only. The defaults are `en-GB` and
+`Europe/London`. `locale` sets `navigator.language` and the `Accept-Language`
+header. An invalid value is a 400 (`invalid locale` / `invalid timezoneId`). The
+IP is still the server's, so a site that picks by IP location still sees the UK.
 
 Request `documentOnly: true` (`/check` only): every request that is not a
 document is failed before it is sent, on every host, so a raw file probe costs
@@ -186,7 +196,7 @@ Treat any `ok:false` as a per-URL failure, not a service failure — record the
 
 ## `/a11y`
 
-`POST /a11y` body `{url, timeout?, viewport?, headers?}` → axe-core results:
+`POST /a11y` body `{url, timeout?, viewport?, headers?, locale?, timezoneId?}` → axe-core results:
 `{ok, url, finalUrl, durationMs, engine:{name,version}, violations:[{id, impact, description, help, helpUrl, nodes:[{target, html, failureSummary}], nodeCount}], incomplete:[…], counts:{violations, incomplete, passes}}`.
 `nodes` is capped at 50 per rule; `impact` ∈ critical|serious|moderate|minor.
 
